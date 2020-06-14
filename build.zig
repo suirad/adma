@@ -6,6 +6,10 @@ pub fn build(b: *Builder) void {
     lib.setBuildMode(mode);
     lib.install();
 
+    const exe = b.addExecutable("adma", "src/adma_tests.zig");
+    exe.setBuildMode(mode);
+    exe.install();
+
     var main_tests = b.addTest("src/adma_tests.zig");
     main_tests.setBuildMode(mode);
 

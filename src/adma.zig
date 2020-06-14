@@ -2,7 +2,7 @@ const std = @import("std");
 const ArrayList = std.ArrayList;
 const mem = std.mem;
 const Allocator = mem.Allocator;
-const page_size = 4096;
+const page_size = mem.page_size;
 
 threadlocal var localAdma: AdmaAllocator = undefined;
 
@@ -12,51 +12,119 @@ pub const AdmaAllocator = struct {
     /// Wrapped allocator
     wrapped_allocator: *Allocator,
 
-    bucket32: Bucket, // cap 128
-    bucket64: Bucket, // cap 64
-    bucket128: Bucket, // cap 32
-    bucket256: Bucket, // cap 16
-    bucket512: Bucket, // cap 8
+    bucket64: Bucket,
+    bucket128: Bucket,
+    bucket256: Bucket,
+    bucket512: Bucket,
+    bucket1024: Bucket,
+    bucket2048: Bucket,
+
+    page_pool: ArrayList(*Page),
 
     const Self = @This();
+    const largest_alloc = 2047;
+
+    /// Initialize with defaults
+    pub fn init() !*Self {
+        return try AdmaAllocator.initWith(std.heap.page_allocator, 3);
+    }
 
     /// Initialize this allocator, passing in an allocator to wrap.
-    pub fn init(allocator: *Allocator) !*Self {
+    pub fn initWith(allocator: *Allocator, initial_pages: usize) !*Self {
+        var self = &localAdma;
         localAdma = Self{
             .allocator = Allocator{
                 .shrinkFn = shrink,
                 .reallocFn = realloc,
             },
             .wrapped_allocator = allocator,
-            .bucket32 = try Bucket.init(32, allocator),
-            .bucket64 = try Bucket.init(64, allocator),
-            .bucket128 = try Bucket.init(128, allocator),
-            .bucket256 = try Bucket.init(256, allocator),
-            .bucket512 = try Bucket.init(512, allocator),
+            .bucket64 = try Bucket.init(64, self),
+            .bucket128 = try Bucket.init(128, self),
+            .bucket256 = try Bucket.init(256, self),
+            .bucket512 = try Bucket.init(512, self),
+            .bucket1024 = try Bucket.init(1024, self),
+            .bucket2048 = try Bucket.init(2048, self),
+            .page_pool = try ArrayList(*Page).initCapacity(allocator, 20),
         };
-        return &localAdma;
+
+        // seed page pool with initial pages
+        try self.seedPages(initial_pages);
+
+        return self;
     }
 
     pub fn deinit(self: *Self) void {
-        self.bucket32.deinit();
         self.bucket64.deinit();
         self.bucket128.deinit();
         self.bucket256.deinit();
         self.bucket512.deinit();
+        self.bucket1024.deinit();
+        self.bucket2048.deinit();
+
+        for (self.page_pool.items) |page| {
+            self.wrapped_allocator.destroy(page);
+        }
+    }
+
+    pub fn seedPages(self: *Self, size: usize) !void {
+        // goofy range
+        for (@as([*]void, undefined)[0..size]) |_, i| {
+            var page = try self.wrapped_allocator.create(Page);
+            try self.page_pool.append(page);
+        }
+    }
+
+    pub fn fetchPage(self: *Self) !*Page {
+        var maybe_page = self.page_pool.popOrNull();
+        if (maybe_page) |page| {
+            return page;
+        }
+
+        try self.seedPages(1);
+        return self.page_pool.pop();
+    }
+
+    pub fn releasePage(self: *Self, page: *Page) !void {
+        if (self.page_pool.items.len < 20) {
+            try self.page_pool.append(page);
+            return;
+        }
+        self.wrapped_allocator.destroy(page);
     }
 
     fn realloc(this: *Allocator, oldmem: []u8, old_align: u29, new_size: usize, new_align: u29) ![]u8 {
         var self = @fieldParentPtr(Self, "allocator", this);
-        if (new_size > 512) {
+
+        std.debug.warn("Allocation size: {} - {} - {} | {} - {} - {}\n", .{ oldmem.len, old_align, 0, new_size, new_align, 0 });
+        if (oldmem.len == 0 and new_size > largest_alloc) {
             return try self.wrappedRealloc(oldmem, old_align, new_size, new_align);
+        } else if (oldmem.len > largest_alloc and (new_size > largest_alloc or new_size == 0)) {
+            return try self.wrappedRealloc(oldmem, old_align, new_size, new_align);
+        } else if (oldmem.len > largest_alloc and new_size < largest_alloc) {
+            var chunk = try self.allocator.alloc(u8, new_size);
+            mem.copy(u8, chunk, oldmem[0 .. chunk.len - 1]);
+            self.wrapped_allocator.free(oldmem);
+            return chunk;
+        } else if (oldmem.len < largest_alloc and new_size > largest_alloc) {
+            var newbuf = try self.wrapped_allocator.alloc(u8, new_size);
+            mem.copy(u8, newbuf, oldmem);
+            self.allocator.free(oldmem);
+            return newbuf;
         }
+
         return try self.internalRealloc(oldmem, old_align, new_size, new_align);
     }
 
     fn shrink(this: *Allocator, oldmem: []u8, old_align: u29, new_size: usize, new_align: u29) []u8 {
         var self = @fieldParentPtr(AdmaAllocator, "allocator", this);
-        if (oldmem.len > 512) {
-            return self.wrappedShrink(oldmem, old_align, new_size, new_align);
+        if (oldmem.len > largest_alloc and new_size == 0) {
+            self.wrapped_allocator.free(oldmem);
+            return "";
+        } else if (oldmem.len > largest_alloc and new_size < largest_alloc) {
+            var chunk = self.allocator.alloc(u8, new_size) catch @panic("Failed to resize external buffer");
+            mem.copy(u8, chunk, oldmem[0 .. chunk.len - 1]);
+            self.wrapped_allocator.free(oldmem);
+            return chunk;
         }
         return self.internalShrink(oldmem, old_align, new_size, new_align);
     }
@@ -71,30 +139,32 @@ pub const AdmaAllocator = struct {
 
     fn pickBucket(self: *Self, size: u16) ?*Bucket {
         return switch (size) {
-            1...31 => &self.bucket32,
-            32...63 => &self.bucket64,
+            1...63 => &self.bucket64,
             64...127 => &self.bucket128,
             128...255 => &self.bucket256,
             256...511 => &self.bucket512,
+            512...1023 => &self.bucket1024,
+            1024...2047 => &self.bucket2048,
             else => null,
         };
     }
 
     fn internalRealloc(self: *Self, oldmem: []u8, old_align: u29, new_size: usize, new_align: u29) ![]u8 {
-        // get old bucket and new bucket
         var old_bucket = self.pickBucket(@intCast(u16, oldmem.len));
         var new_bucket = self.pickBucket(@intCast(u16, new_size));
 
-        if (oldmem.len == 0) {
+        if (oldmem.len == 0 and new_size == 0) {
+            //why would you do this
+            return "";
+        } else if (oldmem.len == 0) {
             if (new_bucket) |bucket| {
                 var newchunk = try bucket.newChunk();
+
                 return newchunk[0..new_size];
             } else {
                 unreachable;
             }
-        }
-
-        if (new_size == 0) {
+        } else if (new_size == 0) {
             if (old_bucket) |bucket| {
                 bucket.freeChunk(oldmem);
                 return "";
@@ -132,37 +202,38 @@ pub const AdmaAllocator = struct {
 
 const Bucket = struct {
     chunk_offset: u16,
-    backup_alloc: *Allocator,
+    parent: *AdmaAllocator,
     pages: ArrayList(*Page),
 
     const Self = @This();
 
-    pub fn init(offset: comptime u16, allocator: *Allocator) !Self {
+    pub fn init(offset: comptime u16, adma: *AdmaAllocator) !Self {
         if (page_size % offset != 0)
             @panic("Offset needs to be 2's complement and smaller than page_size(4096)");
 
-        var pages = try ArrayList(*Page).initCapacity(allocator, 10);
+        var pages = try ArrayList(*Page).initCapacity(adma.wrapped_allocator, 10);
         return Self{
             .chunk_offset = offset,
-            .backup_alloc = allocator,
+            .parent = adma,
             .pages = pages,
         };
     }
 
     pub fn deinit(self: *Self) void {
         for (self.pages.items) |page| {
-            self.backup_alloc.destroy(page);
+            self.parent.wrapped_allocator.destroy(page);
         }
         self.pages.deinit();
     }
 
     pub fn addPage(self: *Self) !*Page {
-        var page = try self.backup_alloc.create(Page);
+        var page = try self.parent.fetchPage();
         try self.pages.append(page);
         return page.init(self.chunk_offset);
     }
 
     pub fn newChunk(self: *Self) ![]u8 {
+        self.collectRemoteChunks();
         for (self.pages.items) |page| {
             var maybe_chunk = page.nextChunk();
 
@@ -177,16 +248,31 @@ const Bucket = struct {
     }
 
     pub fn freeChunk(self: *Self, data: []u8) void {
+        self.collectRemoteChunks();
         for (self.pages.items) |page, i| {
             if (page.freeChunk(data)) {
-                // if Empty, pop page from list and free it
                 if (page.state == .Empty) {
                     _ = self.pages.swapRemove(i);
-                    self.backup_alloc.destroy(page);
+                    self.parent.releasePage(page) catch @panic("Failed to release page to page_pool");
                 }
                 return;
             }
         }
+
+        @panic("Free'd data that no page owns");
+    }
+
+    pub fn freeRemoteChunk(self: *Self, data: []u8) void {
+        // spinlock remote chunks
+        // defer unlock
+        // append to list
+    }
+
+    fn collectRemoteChunks(self: *Self) void {
+        // try lock remote chunks
+        // if failed then return
+        // defer unlock
+        // iterate remote chunks and free
     }
 };
 
@@ -199,56 +285,58 @@ const PageState = enum(u8) {
 const Page = struct {
     state: PageState,
     chunk_size: u16,
-    next_chunk: u8,
-    chunks_left: u8,
-    data: [page_size]u8,
+    next_chunk: u16,
+    chunks_left: u16,
+    data: [page_size * 2]u8,
 
     pub fn init(self: *Page, chunk_size: u16) *Page {
         self.state = .Empty;
         self.chunk_size = chunk_size;
         self.next_chunk = 0;
         self.chunks_left = self.max_chunks();
-        mem.set(u8, self.data[0..self.data.len], 0);
+        mem.set(u8, &self.data, 0);
         return self;
     }
 
-    fn max_chunks(self: *Page) u8 {
-        return @intCast(u8, page_size / self.chunk_size);
+    fn max_chunks(self: *Page) u16 {
+        return @intCast(u16, self.data.len / self.chunk_size);
     }
 
     /// Next chunk or null
     pub fn nextChunk(self: *Page) ?[]u8 {
         if (self.state == .Full) return null;
 
-        // use chunk_size to cast a 2d slice to iterate
         var indx = self.next_chunk;
         const max = self.max_chunks();
 
         while (true) : (indx = if (indx + 1 == max) 0 else indx + 1) {
-            std.debug.warn("size: {}, indx: {}", .{ self.chunk_size, indx });
             const start = self.chunk_size * indx;
             var chunk = self.data[start .. start + self.chunk_size - 1];
-            if (chunk[0] == 0) {
-                chunk[0] = 1; // mark first byte that this chunk is in use
 
-                self.next_chunk = if (indx + 1 == max) 0 else indx + 1;
-                self.chunks_left -= 1;
-
-                if (self.state == .Empty) {
-                    self.state = .Partial;
-                } else if (self.state == .Partial and self.chunks_left == 0) {
-                    self.state = .Full;
-                }
-
-                return chunk[1 .. chunk.len - 1];
+            if (chunk[0] == 1) {
+                continue;
             }
+
+            chunk[0] = 1; // mark first byte that this chunk is in use
+
+            indx += 1;
+            self.next_chunk = if (indx == max) 0 else indx;
+            self.chunks_left -= 1;
+
+            if (self.state == .Empty) {
+                self.state = .Partial;
+            } else if (self.state == .Partial and self.chunks_left == 0) {
+                self.state = .Full;
+            }
+
+            return chunk[1 .. chunk.len - 1];
         }
     }
 
     /// free a chunk, returns if it was successful or not
     pub fn freeChunk(self: *Page, data: []u8) bool {
         // if data not in this page range, then false
-        //TODO: replace with bitmask
+        //NOTE: replace with bitmask
         if ((@ptrToInt(&self.data[0]) <= @ptrToInt(data.ptr) and @ptrToInt(&self.data[self.data.len - 1]) > @ptrToInt(data.ptr)) == false) {
             return false;
         }

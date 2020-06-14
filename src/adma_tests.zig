@@ -4,13 +4,75 @@ const testing = std.testing;
 
 const adma = @import("adma.zig");
 
-test "Use local adma" {
-    // testing.expectEqual(1, 1);
-    var a = try adma.AdmaAllocator.init(std.heap.page_allocator);
+pub fn main() !void {
+    //var a = try adma.AdmaAllocator.init();
+    //defer a.deinit();
+
+    //var aa = &a.allocator;
+    var aa = std.heap.page_allocator;
+    var tmp: [50][]u8 = undefined;
+
+    for (tmp) |_, i| {
+        tmp[i] = try aa.alloc(u8, 2000);
+    }
+
+    for (tmp) |_, i| {
+        aa.free(tmp[i]);
+    }
+}
+
+test "Use adma" {
+    var a = try adma.AdmaAllocator.init();
     defer a.deinit();
 
     var aa = &a.allocator;
-    warn("Trying alloc\n", .{});
-    var string = try aa.alloc(u8, 50);
-    aa.free(string);
+    var tmp: [50][]u8 = undefined;
+
+    for (tmp) |_, i| {
+        tmp[i] = try aa.alloc(u8, 2000);
+    }
+
+    for (tmp) |_, i| {
+        aa.free(tmp[i]);
+    }
+}
+
+test "Resize too large external buffer into adma chunk" {
+    var a = try adma.AdmaAllocator.init();
+    defer a.deinit();
+    var aa = &a.allocator;
+
+    var buf = try aa.alloc(u8, 10000); // dont free
+    var buf2 = try aa.realloc(buf, 1000);
+    aa.free(buf2);
+}
+
+test "Allocate chunk then resize into external buffer" {
+    var a = try adma.AdmaAllocator.init();
+    defer a.deinit();
+    var aa = &a.allocator;
+
+    var buf = try aa.alloc(u8, 1000); // dont free
+    var buf2 = try aa.alloc(u8, 1000);
+    defer aa.free(buf2);
+
+    std.mem.set(u8, buf, 1);
+    std.mem.set(u8, buf2, 1);
+
+    var buf3 = try aa.realloc(buf, 10000);
+    defer aa.free(buf3);
+
+    testing.expectEqualSlices(u8, buf3[0..1000], buf2);
+}
+
+test "Wrapping adma with an arena allocator" {
+    var a = try adma.AdmaAllocator.init();
+    defer a.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(&a.allocator);
+    defer arena.deinit();
+
+    var arenaal = &arena.allocator;
+    var buf = try arenaal.alloc(u8, 50);
+    defer arenaal.free(buf);
 }

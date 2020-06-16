@@ -76,3 +76,16 @@ test "Wrapping adma with an arena allocator" {
     var buf = try arenaal.alloc(u8, 50);
     defer arenaal.free(buf);
 }
+
+test "arraylist" {
+    var a = try adma.AdmaAllocator.init();
+    defer a.deinit();
+    var aa = &a.allocator;
+
+    var list = std.ArrayList(usize).init(aa);
+    try list.ensureCapacity(5000);
+    var x: usize = 0;
+    while (x != 10000) : (x += 1) {
+        _ = try list.append(x);
+    }
+}

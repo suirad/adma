@@ -3,6 +3,7 @@ const ArrayList = std.ArrayList;
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const page_size = mem.page_size;
+const assert = std.debug.assert;
 
 threadlocal var localAdma: AdmaAllocator = undefined;
 
@@ -22,11 +23,11 @@ pub const AdmaAllocator = struct {
     page_pool: ArrayList(*Page),
 
     const Self = @This();
-    const largest_alloc = 2047;
+    const largest_alloc = 2048;
 
     /// Initialize with defaults
     pub fn init() !*Self {
-        return try AdmaAllocator.initWith(std.heap.page_allocator, 3);
+        return try AdmaAllocator.initWith(std.heap.page_allocator, 5);
     }
 
     /// Initialize this allocator, passing in an allocator to wrap.
@@ -95,23 +96,26 @@ pub const AdmaAllocator = struct {
     fn realloc(this: *Allocator, oldmem: []u8, old_align: u29, new_size: usize, new_align: u29) ![]u8 {
         var self = @fieldParentPtr(Self, "allocator", this);
 
-        std.debug.warn("Allocation size: {} - {} - {} | {} - {} - {}\n", .{ oldmem.len, old_align, 0, new_size, new_align, 0 });
-        if (oldmem.len == 0 and new_size > largest_alloc) {
+        if (oldmem.len == 0 and new_size == 0) {
+            //why would you do this
+            return "";
+        } else if (oldmem.len == 0 and new_size > largest_alloc) {
             return try self.wrappedRealloc(oldmem, old_align, new_size, new_align);
         } else if (oldmem.len > largest_alloc and (new_size > largest_alloc or new_size == 0)) {
             return try self.wrappedRealloc(oldmem, old_align, new_size, new_align);
-        } else if (oldmem.len > largest_alloc and new_size < largest_alloc) {
+        } else if (oldmem.len > largest_alloc and new_size <= largest_alloc) {
             var chunk = try self.allocator.alloc(u8, new_size);
             mem.copy(u8, chunk, oldmem[0 .. chunk.len - 1]);
             self.wrapped_allocator.free(oldmem);
             return chunk;
-        } else if (oldmem.len < largest_alloc and new_size > largest_alloc) {
+        } else if (oldmem.len <= largest_alloc and new_size > largest_alloc) {
             var newbuf = try self.wrapped_allocator.alloc(u8, new_size);
             mem.copy(u8, newbuf, oldmem);
             self.allocator.free(oldmem);
             return newbuf;
         }
 
+        assert(new_size <= largest_alloc);
         return try self.internalRealloc(oldmem, old_align, new_size, new_align);
     }
 
@@ -139,12 +143,12 @@ pub const AdmaAllocator = struct {
 
     fn pickBucket(self: *Self, size: u16) ?*Bucket {
         return switch (size) {
-            1...63 => &self.bucket64,
-            64...127 => &self.bucket128,
-            128...255 => &self.bucket256,
-            256...511 => &self.bucket512,
-            512...1023 => &self.bucket1024,
-            1024...2047 => &self.bucket2048,
+            1...64 => &self.bucket64,
+            65...128 => &self.bucket128,
+            129...256 => &self.bucket256,
+            257...512 => &self.bucket512,
+            513...1024 => &self.bucket1024,
+            1025...2048 => &self.bucket2048,
             else => null,
         };
     }
@@ -153,13 +157,9 @@ pub const AdmaAllocator = struct {
         var old_bucket = self.pickBucket(@intCast(u16, oldmem.len));
         var new_bucket = self.pickBucket(@intCast(u16, new_size));
 
-        if (oldmem.len == 0 and new_size == 0) {
-            //why would you do this
-            return "";
-        } else if (oldmem.len == 0) {
+        if (oldmem.len == 0) {
             if (new_bucket) |bucket| {
                 var newchunk = try bucket.newChunk();
-
                 return newchunk[0..new_size];
             } else {
                 unreachable;
@@ -171,10 +171,6 @@ pub const AdmaAllocator = struct {
             } else {
                 unreachable;
             }
-        }
-
-        if (new_size < oldmem.len) {
-            return oldmem[0..new_size];
         }
 
         var newchunk = try new_bucket.?.newChunk();
@@ -287,6 +283,9 @@ const Page = struct {
     chunk_size: u16,
     next_chunk: u16,
     chunks_left: u16,
+    page_start: usize,
+    page_end: usize,
+    meta: [128]u8,
     data: [page_size * 2]u8,
 
     pub fn init(self: *Page, chunk_size: u16) *Page {
@@ -294,11 +293,13 @@ const Page = struct {
         self.chunk_size = chunk_size;
         self.next_chunk = 0;
         self.chunks_left = self.max_chunks();
-        mem.set(u8, &self.data, 0);
+        self.page_start = @ptrToInt(&self.data[0]);
+        self.page_end = @ptrToInt(&self.data[self.data.len - 1]);
+        mem.set(u8, &self.meta, 0);
         return self;
     }
 
-    fn max_chunks(self: *Page) u16 {
+    fn max_chunks(self: *const Page) u16 {
         return @intCast(u16, self.data.len / self.chunk_size);
     }
 
@@ -310,17 +311,22 @@ const Page = struct {
         const max = self.max_chunks();
 
         while (true) : (indx = if (indx + 1 == max) 0 else indx + 1) {
-            const start = self.chunk_size * indx;
-            var chunk = self.data[start .. start + self.chunk_size - 1];
-
-            if (chunk[0] == 1) {
+            if (self.meta[indx] == 1) {
                 continue;
             }
 
-            chunk[0] = 1; // mark first byte that this chunk is in use
+            const start = self.chunk_size * indx;
+            const end = start + self.chunk_size;
 
-            indx += 1;
-            self.next_chunk = if (indx == max) 0 else indx;
+            assert(indx < max);
+            assert(start < self.data.len);
+            assert(end <= self.data.len);
+
+            var chunk = self.data[start..end];
+
+            self.meta[indx] = 1;
+
+            self.next_chunk = indx;
             self.chunks_left -= 1;
 
             if (self.state == .Empty) {
@@ -329,7 +335,8 @@ const Page = struct {
                 self.state = .Full;
             }
 
-            return chunk[1 .. chunk.len - 1];
+            mem.set(u8, chunk, 0);
+            return chunk;
         }
     }
 
@@ -337,15 +344,16 @@ const Page = struct {
     pub fn freeChunk(self: *Page, data: []u8) bool {
         // if data not in this page range, then false
         //NOTE: replace with bitmask
-        if ((@ptrToInt(&self.data[0]) <= @ptrToInt(data.ptr) and @ptrToInt(&self.data[self.data.len - 1]) > @ptrToInt(data.ptr)) == false) {
+        const data_start = @ptrToInt(data.ptr);
+        if ((self.page_start <= data_start and self.page_end > data_start) == false) {
             return false;
         }
 
-        var chunk = (data.ptr - 1)[0 .. self.chunk_size - 1];
+        const meta_index = (data_start - self.page_start) / self.chunk_size;
 
-        chunk[0] = 0;
-
+        self.meta[meta_index] = 0;
         self.chunks_left += 1;
+
         if (self.state == .Full) {
             self.state = .Partial;
         } else if (self.state == .Partial and self.chunks_left == self.max_chunks()) {

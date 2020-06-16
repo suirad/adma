@@ -83,9 +83,34 @@ test "arraylist" {
     var aa = &a.allocator;
 
     var list = std.ArrayList(usize).init(aa);
+    defer list.deinit();
     try list.ensureCapacity(5000);
     var x: usize = 0;
     while (x != 10000) : (x += 1) {
         _ = try list.append(x);
     }
+}
+
+fn threadFree(buf: []u8) !void {
+    var a = try adma.AdmaAllocator.init();
+    defer a.deinit();
+    var aa = &a.allocator;
+
+    aa.free(buf);
+}
+
+test "free remote chunk" {
+    var a = try adma.AdmaAllocator.init();
+    defer a.deinit();
+    var aa = &a.allocator;
+
+    var buf = try aa.alloc(u8, 1000);
+    var buf2 = try aa.alloc(u8, 1000);
+
+    var thd = try std.Thread.spawn(buf, threadFree);
+    thd.wait();
+
+    var buf3 = try aa.alloc(u8, 1000);
+    aa.free(buf2); // should also free buf1
+    aa.free(buf3);
 }

@@ -2,24 +2,7 @@ const std = @import("std");
 const warn = std.debug.warn;
 const testing = std.testing;
 
-const adma = @import("adma.zig");
-
-pub fn main() !void {
-    //var a = adma.AdmaAllocator.init();
-    //defer a.deinit();
-
-    //var aa = &a.allocator;
-    var aa = std.heap.page_allocator;
-    var tmp: [50][]u8 = undefined;
-
-    for (tmp) |_, i| {
-        tmp[i] = try aa.alloc(u8, 2000);
-    }
-
-    for (tmp) |_, i| {
-        aa.free(tmp[i]);
-    }
-}
+const adma = @import("adma");
 
 test "Use adma" {
     var a = adma.AdmaAllocator.init();

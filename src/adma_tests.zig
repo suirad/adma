@@ -5,7 +5,7 @@ const testing = std.testing;
 const adma = @import("adma.zig");
 
 pub fn main() !void {
-    //var a = try adma.AdmaAllocator.init();
+    //var a = adma.AdmaAllocator.init();
     //defer a.deinit();
 
     //var aa = &a.allocator;
@@ -22,7 +22,7 @@ pub fn main() !void {
 }
 
 test "Use adma" {
-    var a = try adma.AdmaAllocator.init();
+    var a = adma.AdmaAllocator.init();
     defer a.deinit();
 
     var aa = &a.allocator;
@@ -38,7 +38,7 @@ test "Use adma" {
 }
 
 test "Resize too large external buffer into adma chunk" {
-    var a = try adma.AdmaAllocator.init();
+    var a = adma.AdmaAllocator.init();
     defer a.deinit();
     var aa = &a.allocator;
 
@@ -48,7 +48,7 @@ test "Resize too large external buffer into adma chunk" {
 }
 
 test "Allocate chunk then resize into external buffer" {
-    var a = try adma.AdmaAllocator.init();
+    var a = adma.AdmaAllocator.init();
     defer a.deinit();
     var aa = &a.allocator;
 
@@ -66,7 +66,7 @@ test "Allocate chunk then resize into external buffer" {
 }
 
 test "Wrapping adma with an arena allocator" {
-    var a = try adma.AdmaAllocator.init();
+    var a = adma.AdmaAllocator.init();
     defer a.deinit();
 
     var arena = std.heap.ArenaAllocator.init(&a.allocator);
@@ -78,7 +78,7 @@ test "Wrapping adma with an arena allocator" {
 }
 
 test "arraylist" {
-    var a = try adma.AdmaAllocator.init();
+    var a = adma.AdmaAllocator.init();
     defer a.deinit();
     var aa = &a.allocator;
 
@@ -92,7 +92,7 @@ test "arraylist" {
 }
 
 fn threadFree(buf: []u8) !void {
-    var a = try adma.AdmaAllocator.init();
+    var a = adma.AdmaAllocator.init();
     defer a.deinit();
     var aa = &a.allocator;
 
@@ -100,7 +100,7 @@ fn threadFree(buf: []u8) !void {
 }
 
 test "free remote chunk" {
-    var a = try adma.AdmaAllocator.init();
+    var a = adma.AdmaAllocator.init();
     defer a.deinit();
     var aa = &a.allocator;
 

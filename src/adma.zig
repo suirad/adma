@@ -17,22 +17,22 @@ threadlocal var localAdma: AdmaAllocator = undefined;
 const LostAndFound = struct {
     init: bool = false,
     allocator: *Allocator = undefined,
-    collector64: Collector = .{ .list = undefined },
-    collector128: Collector = .{ .list = undefined },
-    collector256: Collector = .{ .list = undefined },
-    collector512: Collector = .{ .list = undefined },
-    collector1024: Collector = .{ .list = undefined },
-    collector2048: Collector = .{ .list = undefined },
+    collector64: Collector = .{},
+    collector128: Collector = .{},
+    collector256: Collector = .{},
+    collector512: Collector = .{},
+    collector1024: Collector = .{},
+    collector2048: Collector = .{},
     thread_count: usize = 1,
 
     const Self = @This();
 
     const Collector = struct {
-        list: ArrayList([]u8),
+        list: ArrayList([]u8) = undefined,
         lock: u8 = 1,
     };
 
-    pub fn init(allocator: *Allocator) !void {
+    pub fn init(allocator: *Allocator) void {
         if (global_collector.init == true) {
             _ = @atomicRmw(usize, &global_collector.thread_count, .Add, 1, .SeqCst);
             return;
@@ -144,13 +144,13 @@ pub const AdmaAllocator = struct {
     const largest_alloc = 2048;
 
     /// Initialize with defaults
-    pub fn init() !*Self {
-        return try AdmaAllocator.initWith(std.heap.page_allocator, 0);
+    pub fn init() *Self {
+        return AdmaAllocator.initWith(std.heap.page_allocator, 0) catch unreachable;
     }
 
     /// Initialize this allocator, passing in an allocator to wrap.
     pub fn initWith(allocator: *Allocator, initial_slabs: usize) !*Self {
-        try LostAndFound.init(allocator);
+        LostAndFound.init(allocator);
 
         var self = &localAdma;
         localAdma = Self{
@@ -159,13 +159,13 @@ pub const AdmaAllocator = struct {
                 .reallocFn = realloc,
             },
             .wrapped_allocator = allocator,
-            .bucket64 = try Bucket.init(64, self),
-            .bucket128 = try Bucket.init(128, self),
-            .bucket256 = try Bucket.init(256, self),
-            .bucket512 = try Bucket.init(512, self),
-            .bucket1024 = try Bucket.init(1024, self),
-            .bucket2048 = try Bucket.init(2048, self),
-            .slab_pool = try ArrayList(*Slab).initCapacity(allocator, 20),
+            .bucket64 = Bucket.init(64, self),
+            .bucket128 = Bucket.init(128, self),
+            .bucket256 = Bucket.init(256, self),
+            .bucket512 = Bucket.init(512, self),
+            .bucket1024 = Bucket.init(1024, self),
+            .bucket2048 = Bucket.init(2048, self),
+            .slab_pool = ArrayList(*Slab).init(allocator),
         };
 
         // seed slab pool with initial slabs
@@ -186,6 +186,7 @@ pub const AdmaAllocator = struct {
         for (self.slab_pool.items) |slab| {
             self.wrapped_allocator.destroy(slab);
         }
+        self.slab_pool.deinit();
     }
 
     pub fn seedSlabs(self: *Self, size: usize) !void {
@@ -219,6 +220,11 @@ pub const AdmaAllocator = struct {
     fn realloc(this: *Allocator, oldmem: []u8, old_align: u29, new_size: usize, new_align: u29) ![]u8 {
         var self = @fieldParentPtr(Self, "allocator", this);
 
+        if (std.builtin.mode == .Debug or std.builtin.mode == .ReleaseSafe) {
+            if (self != &localAdma)
+                @panic("AdmaAllocator pointer passed to another thread; to do this safely, in the new thread init an AdmaAllocator");
+        }
+
         if (oldmem.len == 0 and new_size == 0) {
             //why would you do this
             return "";
@@ -244,6 +250,12 @@ pub const AdmaAllocator = struct {
 
     fn shrink(this: *Allocator, oldmem: []u8, old_align: u29, new_size: usize, new_align: u29) []u8 {
         var self = @fieldParentPtr(AdmaAllocator, "allocator", this);
+
+        if (std.builtin.mode == .Debug or std.builtin.mode == .ReleaseSafe) {
+            if (self != &localAdma)
+                @panic("AdmaAllocator pointer passed to another thread; to do this safely, in the new thread init an AdmaAllocator");
+        }
+
         if (oldmem.len > largest_alloc and new_size == 0) {
             self.wrapped_allocator.free(oldmem);
             return "";
@@ -319,11 +331,11 @@ const Bucket = struct {
 
     const Self = @This();
 
-    pub fn init(comptime offset: u16, adma: *AdmaAllocator) !Self {
+    pub fn init(comptime offset: u16, adma: *AdmaAllocator) Self {
         comptime if (page_size % offset != 0)
             @panic("Offset needs to be 2's complement and smaller than page_size(4096)");
 
-        var slabs = try ArrayList(*Slab).initCapacity(adma.wrapped_allocator, 10);
+        var slabs = ArrayList(*Slab).init(adma.wrapped_allocator);
         return Self{
             .chunk_size = offset,
             .parent = adma,
@@ -392,6 +404,8 @@ const Bucket = struct {
     fn tryCollectRemoteChunks(self: *Self) void {
         var list = global_collector.tryLock(self.chunk_size) orelse return;
         defer global_collector.unlock(self.chunk_size);
+
+        if (list.items.len == 0) return;
 
         // if freeChunk successful then restart list iteration
         outer: while (true) {

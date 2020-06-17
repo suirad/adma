@@ -100,6 +100,8 @@ fn threadFree(buf: []u8) !void {
 }
 
 test "free remote chunk" {
+    if (std.builtin.single_threaded == true) return;
+
     var a = adma.AdmaAllocator.init();
     defer a.deinit();
     var aa = &a.allocator;

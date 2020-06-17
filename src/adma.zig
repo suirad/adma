@@ -14,115 +14,129 @@ var global_collector: LostAndFound = .{};
 threadlocal var localAdma: AdmaAllocator = undefined;
 
 ///
-const LostAndFound = struct {
-    init: bool = false,
-    allocator: *Allocator = undefined,
-    collector64: Collector = .{},
-    collector128: Collector = .{},
-    collector256: Collector = .{},
-    collector512: Collector = .{},
-    collector1024: Collector = .{},
-    collector2048: Collector = .{},
-    thread_count: usize = 1,
+const LostAndFound = if (std.builtin.single_threaded == false)
+    struct {
+        init: bool = false,
+        allocator: *Allocator = undefined,
+        collector64: Collector = .{},
+        collector128: Collector = .{},
+        collector256: Collector = .{},
+        collector512: Collector = .{},
+        collector1024: Collector = .{},
+        collector2048: Collector = .{},
+        thread_count: usize = 1,
 
-    const Self = @This();
+        const Self = @This();
 
-    const Collector = struct {
-        list: ArrayList([]u8) = undefined,
-        lock: u8 = 1,
-    };
+        const Collector = struct {
+            list: ArrayList([]u8) = undefined,
+            lock: u8 = 1,
+        };
 
-    pub fn init(allocator: *Allocator) void {
-        if (global_collector.init == true) {
-            _ = @atomicRmw(usize, &global_collector.thread_count, .Add, 1, .SeqCst);
-            return;
+        pub fn init(allocator: *Allocator) void {
+            if (global_collector.init == true) {
+                _ = @atomicRmw(usize, &global_collector.thread_count, .Add, 1, .SeqCst);
+                return;
+            }
+            global_collector.init = true;
+            global_collector.allocator = allocator;
+            global_collector.collector64.list = ArrayList([]u8).init(allocator);
+            global_collector.collector128.list = ArrayList([]u8).init(allocator);
+            global_collector.collector256.list = ArrayList([]u8).init(allocator);
+            global_collector.collector512.list = ArrayList([]u8).init(allocator);
+            global_collector.collector1024.list = ArrayList([]u8).init(allocator);
+            global_collector.collector2048.list = ArrayList([]u8).init(allocator);
+            global_collector.thread_count = 1;
         }
-        global_collector.init = true;
-        global_collector.allocator = allocator;
-        global_collector.collector64.list = ArrayList([]u8).init(allocator);
-        global_collector.collector128.list = ArrayList([]u8).init(allocator);
-        global_collector.collector256.list = ArrayList([]u8).init(allocator);
-        global_collector.collector512.list = ArrayList([]u8).init(allocator);
-        global_collector.collector1024.list = ArrayList([]u8).init(allocator);
-        global_collector.collector2048.list = ArrayList([]u8).init(allocator);
-        global_collector.thread_count = 1;
-    }
 
-    pub fn deinit(self: *Self) void {
-        const count = @atomicRmw(usize, &self.thread_count, .Sub, 1, .SeqCst);
-        if (count > 1) return;
+        pub fn deinit(self: *Self) void {
+            const count = @atomicRmw(usize, &self.thread_count, .Sub, 1, .SeqCst);
+            if (count > 1) return;
 
-        // check for leaks and deinit all lists
-        assert(self.collector64.list.items.len == 0); // chunk was not collected by a thread
-        self.collector64.list.deinit();
-        assert(self.collector128.list.items.len == 0); // chunk was not collected by a thread
-        self.collector128.list.deinit();
-        assert(self.collector256.list.items.len == 0); // chunk was not collected by a thread
-        self.collector256.list.deinit();
-        assert(self.collector512.list.items.len == 0); // chunk was not collected by a thread
-        self.collector512.list.deinit();
-        assert(self.collector1024.list.items.len == 0); // chunk was not collected by a thread
-        self.collector1024.list.deinit();
-        assert(self.collector2048.list.items.len == 0); // chunk was not collected by a thread
-        self.collector2048.list.deinit();
-        self.init = false;
-    }
+            // check for leaks and deinit all lists
+            assert(self.collector64.list.items.len == 0); // chunk was not collected by a thread
+            self.collector64.list.deinit();
+            assert(self.collector128.list.items.len == 0); // chunk was not collected by a thread
+            self.collector128.list.deinit();
+            assert(self.collector256.list.items.len == 0); // chunk was not collected by a thread
+            self.collector256.list.deinit();
+            assert(self.collector512.list.items.len == 0); // chunk was not collected by a thread
+            self.collector512.list.deinit();
+            assert(self.collector1024.list.items.len == 0); // chunk was not collected by a thread
+            self.collector1024.list.deinit();
+            assert(self.collector2048.list.items.len == 0); // chunk was not collected by a thread
+            self.collector2048.list.deinit();
+            self.init = false;
+        }
 
-    pub fn lock(self: *Self, list_size: u16) void {
-        const this = self.pickLock(list_size);
-        while (true) {
-            if (@atomicRmw(u8, this, .Xchg, 0, .AcqRel) == 1) {
-                break;
+        pub fn lock(self: *Self, list_size: u16) void {
+            const this = self.pickLock(list_size);
+            while (true) {
+                if (@atomicRmw(u8, this, .Xchg, 0, .AcqRel) == 1) {
+                    break;
+                }
+            }
+        }
+
+        pub fn tryLock(self: *Self, list_size: u16) ?*ArrayList([]u8) {
+            const this = self.pickLock(list_size);
+            const is_locked = @atomicRmw(u8, this, .Xchg, 0, .AcqRel) == 1;
+
+            if (is_locked == false) {
+                return null;
+            }
+
+            const list = self.pickList(list_size);
+            if (is_locked and list.items.len == 0) {
+                @atomicStore(u8, this, 1, .Release);
+                return null;
+            }
+
+            return list;
+        }
+
+        pub fn unlock(self: *Self, list_size: u16) void {
+            const this = self.pickLock(list_size);
+            @atomicStore(u8, this, 1, .Release);
+        }
+
+        pub fn pickList(self: *Self, list_size: u16) *ArrayList([]u8) {
+            switch (list_size) {
+                64 => return &self.collector64.list,
+                128 => return &self.collector128.list,
+                256 => return &self.collector256.list,
+                512 => return &self.collector512.list,
+                1024 => return &self.collector1024.list,
+                2048 => return &self.collector2048.list,
+                else => @panic("Invalid list size"),
+            }
+        }
+
+        fn pickLock(self: *Self, list_size: u16) *u8 {
+            switch (list_size) {
+                64 => return &self.collector64.lock,
+                128 => return &self.collector128.lock,
+                256 => return &self.collector256.lock,
+                512 => return &self.collector512.lock,
+                1024 => return &self.collector1024.lock,
+                2048 => return &self.collector2048.lock,
+                else => @panic("Invalid lock size"),
             }
         }
     }
-
-    pub fn tryLock(self: *Self, list_size: u16) ?*ArrayList([]u8) {
-        const this = self.pickLock(list_size);
-        const is_locked = @atomicRmw(u8, this, .Xchg, 0, .AcqRel) == 1;
-
-        if (is_locked == false) {
+else
+// Empty global for single threaded mode
+    struct {
+        const Self = @This();
+        pub inline fn init(a: *Allocator) void {}
+        pub inline fn deinit(s: *Self) void {}
+        pub inline fn lock(s: *Self, si: u16) void {}
+        pub inline fn tryLock(s: *Self, si: u16) ?*ArrayList([]u8) {
             return null;
         }
-
-        const list = self.pickList(list_size);
-        if (is_locked and list.items.len == 0) {
-            @atomicStore(u8, this, 1, .Release);
-            return null;
-        }
-
-        return list;
-    }
-
-    pub fn unlock(self: *Self, list_size: u16) void {
-        const this = self.pickLock(list_size);
-        @atomicStore(u8, this, 1, .Release);
-    }
-
-    pub fn pickList(self: *Self, list_size: u16) *ArrayList([]u8) {
-        switch (list_size) {
-            64 => return &self.collector64.list,
-            128 => return &self.collector128.list,
-            256 => return &self.collector256.list,
-            512 => return &self.collector512.list,
-            1024 => return &self.collector1024.list,
-            2048 => return &self.collector2048.list,
-            else => @panic("Invalid list size"),
-        }
-    }
-
-    fn pickLock(self: *Self, list_size: u16) *u8 {
-        switch (list_size) {
-            64 => return &self.collector64.lock,
-            128 => return &self.collector128.lock,
-            256 => return &self.collector256.lock,
-            512 => return &self.collector512.lock,
-            1024 => return &self.collector1024.lock,
-            2048 => return &self.collector2048.lock,
-            else => @panic("Invalid lock size"),
-        }
-    }
-};
+        pub inline fn unlock(s: *Self, si: u16) void {}
+        pub inline fn pickList(s: *Self, si: u16) void {}
+    };
 
 pub const AdmaAllocator = struct {
     init: bool = false,
@@ -394,6 +408,9 @@ const Bucket = struct {
     }
 
     fn freeRemoteChunk(self: *Self, data: []u8) void {
+        if (std.builtin.single_threaded)
+            @panic("Free'd invalid chunk. Ensure this data is allocated with Adma");
+
         global_collector.lock(self.chunk_size);
         defer global_collector.unlock(self.chunk_size);
 
@@ -419,6 +436,8 @@ const Bucket = struct {
         }
     }
     fn collectRemoteChunks(self: *Self) void {
+        if (std.builtin.single_threaded) return;
+
         global_collector.lock(self.chunk_size);
         defer global_collector.unlock(self.chunk_size);
 

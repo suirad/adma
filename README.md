@@ -1,6 +1,4 @@
-# A.D.M.A -- Acronyms Dont Mean Anything
-
------
+# A.D.M.A - Acronyms Dont Mean Anything
 
 Adma is a general purpose allocator for zig with the following features:
 
@@ -38,5 +36,5 @@ pub fn example() !void {
 ## Usage Notes
 
 - If using adma in a multithreaded context, ensure you `AdmaAllocator.init/deinit`
- in every thread
+ in every thread; not pass the allocator pointer to the additional thread
 

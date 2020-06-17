@@ -13,7 +13,8 @@ var global_collector: LostAndFound = .{};
 /// Subsequent calls to init return a pointer to the same instance
 threadlocal var localAdma: AdmaAllocator = undefined;
 
-///
+/// This struct is used to track allocations that are free'd in different threads than the ones that created them
+/// This allows the solo thread based AdmaAllocator's to be used safely in a multithreaded context
 const LostAndFound = if (std.builtin.single_threaded == false)
     struct {
         init: bool = false,
@@ -155,6 +156,8 @@ pub const AdmaAllocator = struct {
     slab_pool: ArrayList(*Slab),
 
     const Self = @This();
+
+    /// This is used for checking if this allocator is servicing an allocation or the wrapped allocator
     const largest_alloc = 2048;
 
     /// Initialize with defaults
@@ -167,6 +170,8 @@ pub const AdmaAllocator = struct {
         LostAndFound.init(allocator);
 
         var self = &localAdma;
+        if (self.init == true) return self;
+
         localAdma = Self{
             .allocator = Allocator{
                 .shrinkFn = shrink,
@@ -185,6 +190,7 @@ pub const AdmaAllocator = struct {
         // seed slab pool with initial slabs
         try self.seedSlabs(initial_slabs);
 
+        self.init = true;
         return self;
     }
 
@@ -201,8 +207,10 @@ pub const AdmaAllocator = struct {
             self.wrapped_allocator.destroy(slab);
         }
         self.slab_pool.deinit();
+        self.init = false;
     }
 
+    /// Adds `size` number of slabs to this threads slab pool
     pub fn seedSlabs(self: *Self, size: usize) !void {
         if (size == 0) return;
 
@@ -213,6 +221,7 @@ pub const AdmaAllocator = struct {
         }
     }
 
+    /// Take a slab from the slab pool; allocates one if needed
     pub fn fetchSlab(self: *Self) !*Slab {
         var maybe_slab = self.slab_pool.popOrNull();
         if (maybe_slab) |slab| {
@@ -223,6 +232,7 @@ pub const AdmaAllocator = struct {
         return self.slab_pool.pop();
     }
 
+    /// Give a slab back to the slab pool; if pool is full, free the slab
     pub fn releaseSlab(self: *Self, slab: *Slab) !void {
         if (self.slab_pool.items.len < 20) {
             try self.slab_pool.append(slab);
@@ -231,6 +241,7 @@ pub const AdmaAllocator = struct {
         self.wrapped_allocator.destroy(slab);
     }
 
+    /// Allocator entrypoint
     fn realloc(this: *Allocator, oldmem: []u8, old_align: u29, new_size: usize, new_align: u29) ![]u8 {
         var self = @fieldParentPtr(Self, "allocator", this);
 
@@ -262,6 +273,7 @@ pub const AdmaAllocator = struct {
         return try self.internalRealloc(oldmem, old_align, new_size, new_align);
     }
 
+    /// Allocator entrypoint
     fn shrink(this: *Allocator, oldmem: []u8, old_align: u29, new_size: usize, new_align: u29) []u8 {
         var self = @fieldParentPtr(AdmaAllocator, "allocator", this);
 
@@ -282,14 +294,17 @@ pub const AdmaAllocator = struct {
         return self.internalShrink(oldmem, old_align, new_size, new_align);
     }
 
+    /// Call wrapped allocator realloc; mostly used for allocations that are larger than largest_alloc
     inline fn wrappedRealloc(self: *Self, oldmem: []u8, old_align: u29, new_size: usize, new_align: u29) ![]u8 {
         return try self.wrapped_allocator.reallocFn(self.wrapped_allocator, oldmem, old_align, new_size, new_align);
     }
 
+    /// Call wrapped allocator realloc; mostly used for allocations that are larger than largest_alloc
     inline fn wrappedShrink(self: *Self, oldmem: []u8, old_align: u29, new_size: usize, new_align: u29) []u8 {
         return self.wrapped_allocator.shrinkFn(self.wrapped_allocator, oldmem, old_align, new_align, new_align);
     }
 
+    /// Select a bucked based on the size given
     fn pickBucket(self: *Self, size: u16) ?*Bucket {
         return switch (size) {
             1...64 => &self.bucket64,
@@ -302,6 +317,7 @@ pub const AdmaAllocator = struct {
         };
     }
 
+    /// After entrypoint handles validation of sizing, this is the internal handler
     fn internalRealloc(self: *Self, oldmem: []u8, old_align: u29, new_size: usize, new_align: u29) ![]u8 {
         var old_bucket = self.pickBucket(@intCast(u16, oldmem.len));
         var new_bucket = self.pickBucket(@intCast(u16, new_size));
@@ -321,6 +337,7 @@ pub const AdmaAllocator = struct {
         return newchunk[0..new_size];
     }
 
+    /// After entrypoint handles validation of sizing, this is the internal handler
     fn internalShrink(self: *Self, oldmem: []u8, old_align: u29, new_size: usize, new_align: u29) []u8 {
         var old_bucket = self.pickBucket(@intCast(u16, oldmem.len));
         var new_bucket = self.pickBucket(@intCast(u16, new_size));
@@ -338,6 +355,7 @@ pub const AdmaAllocator = struct {
     }
 };
 
+/// This structure holds all slabs of a given size and uses them to provide allocations
 const Bucket = struct {
     chunk_size: u16,
     parent: *AdmaAllocator,
@@ -366,12 +384,14 @@ const Bucket = struct {
         self.slabs.deinit();
     }
 
+    /// Fetches a slab from the slab pool and adds it to the internal tracker
     pub fn addSlab(self: *Self) !*Slab {
         var slab = try self.parent.fetchSlab();
         try self.slabs.append(slab);
         return slab.init(self.chunk_size);
     }
 
+    /// Iterates slabs to find an available chunk; if no slabs have space, request a new one from slab pool
     pub fn newChunk(self: *Self) ![]u8 {
         for (self.slabs.items) |slab| {
             var maybe_chunk = slab.nextChunk();
@@ -386,6 +406,7 @@ const Bucket = struct {
         return chunk;
     }
 
+    /// Iterates tracked slabs and attempts to free the chunk
     pub fn freeChunk(self: *Self, data: []u8, remote: bool) bool {
         if (remote == false) {
             self.tryCollectRemoteChunks();
@@ -407,6 +428,7 @@ const Bucket = struct {
         return false;
     }
 
+    /// Adds the chunk to the global free list for this chunk_size
     fn freeRemoteChunk(self: *Self, data: []u8) void {
         if (std.builtin.single_threaded)
             @panic("Free'd invalid chunk. Ensure this data is allocated with Adma");
@@ -418,6 +440,7 @@ const Bucket = struct {
         list.append(data) catch @panic("Failed to add global chunk");
     }
 
+    /// Casually locks the global freelist for this size; then attempts to free them
     fn tryCollectRemoteChunks(self: *Self) void {
         var list = global_collector.tryLock(self.chunk_size) orelse return;
         defer global_collector.unlock(self.chunk_size);
@@ -435,6 +458,8 @@ const Bucket = struct {
             break;
         }
     }
+
+    /// Actively waits to lock the global freelist for this size and attempts to free the chunks
     fn collectRemoteChunks(self: *Self) void {
         if (std.builtin.single_threaded) return;
 
@@ -460,6 +485,7 @@ const SlabState = enum(u8) {
     Full,
 };
 
+/// Slab slices a doublepage by a specific size and services allocations from it
 const Slab = struct {
     state: SlabState,
     chunk_size: u16,
@@ -481,11 +507,7 @@ const Slab = struct {
         return self;
     }
 
-    fn max_chunks(self: *const Slab) u16 {
-        return @intCast(u16, self.data.len / self.chunk_size);
-    }
-
-    /// Next chunk or null
+    /// Attempts to service a chunk request
     pub fn nextChunk(self: *Slab) ?[]u8 {
         if (self.state == .Full) return null;
 
@@ -522,10 +544,8 @@ const Slab = struct {
         }
     }
 
-    /// free a chunk, returns if it was successful or not
+    /// Attempts to free a chunk by checking if the data ptr falls within the memory space of this Slabs .data
     pub fn freeChunk(self: *Slab, data: []u8) bool {
-        // if data not in this slab range, then false
-        //NOTE: replace with bitmask
         const data_start = @ptrToInt(data.ptr);
         if ((self.slab_start <= data_start and self.slab_end > data_start) == false) {
             return false;
@@ -543,5 +563,10 @@ const Slab = struct {
         }
 
         return true;
+    }
+
+    /// Calculate the max number of chunks for this slabs chunk_size
+    fn max_chunks(self: *const Slab) u16 {
+        return @intCast(u16, self.data.len / self.chunk_size);
     }
 };

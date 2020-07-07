@@ -37,4 +37,6 @@ pub fn example() !void {
 
 - If using adma in a multithreaded context, ensure you `AdmaAllocator.init/deinit`
  in every thread; not pass the allocator pointer to the additional thread
+- If using for zig prior to the big allocation interface change, see the branch
+called `pre-allocator-revamp`
 

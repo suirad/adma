@@ -27,6 +27,7 @@ test "Resize too large external buffer into adma chunk" {
 
     var buf = try aa.alloc(u8, 10000); // dont free
     var buf2 = try aa.realloc(buf, 1000);
+    testing.expect(buf2.len == adma.AdmaAllocator.largest_alloc + 1);
     aa.free(buf2);
 }
 

@@ -2,9 +2,10 @@ const Builder = @import("std").build.Builder;
 
 pub fn build(b: *Builder) void {
     const mode = b.standardReleaseOptions();
-    const lib = b.addStaticLibrary("adma", "src/adma.zig");
-    lib.setBuildMode(mode);
-    //lib.install();
+    //const exe = b.addExecutable("adma", "tests/adma_tests.zig");
+    //exe.addPackagePath("adma", "src/adma.zig");
+    //exe.setBuildMode(mode);
+    //exe.install();
 
     var main_tests = b.addTest("tests/adma_tests.zig");
     main_tests.setBuildMode(mode);

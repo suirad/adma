@@ -158,7 +158,7 @@ pub const AdmaAllocator = struct {
     const Self = @This();
 
     /// This is used for checking if this allocator is servicing an allocation or the wrapped allocator
-    const largest_alloc = 2048;
+    pub const largest_alloc = 2048;
 
     /// Initialize with defaults
     pub fn init() *Self {
@@ -174,8 +174,8 @@ pub const AdmaAllocator = struct {
 
         localAdma = Self{
             .allocator = Allocator{
-                .shrinkFn = shrink,
-                .reallocFn = realloc,
+                .allocFn = adma_alloc,
+                .resizeFn = adma_resize,
             },
             .wrapped_allocator = allocator,
             .bucket64 = Bucket.init(64, self),
@@ -242,66 +242,47 @@ pub const AdmaAllocator = struct {
     }
 
     /// Allocator entrypoint
-    fn realloc(this: *Allocator, oldmem: []u8, old_align: u29, new_size: usize, new_align: u29) ![]u8 {
+    fn adma_alloc(this: *Allocator, len: usize, ptr_align: u29, len_align: u29) ![]u8 {
         var self = @fieldParentPtr(Self, "allocator", this);
 
-        if (std.builtin.mode == .Debug or std.builtin.mode == .ReleaseSafe) {
+        if (len == 0) {
+            return "";
+        } else if (len > largest_alloc) {
+            return try self.wrapped_allocator.alloc(u8, len);
+        }
+
+        assert(len <= largest_alloc);
+        return try self.internal_alloc(len);
+    }
+
+    fn adma_resize(this: *Allocator, oldmem: []u8, new_size: usize, len_align: u29) !usize {
+        var self = @fieldParentPtr(Self, "allocator", this);
+
+        if (std.builtin.mode == .Debug or std.builtin.mode == .ReleaseSafe)
             if (self != &localAdma)
                 @panic("AdmaAllocator pointer passed to another thread; to do this safely, in the new thread init an AdmaAllocator");
-        }
 
         if (oldmem.len == 0 and new_size == 0) {
             //why would you do this
-            return "";
-        } else if (oldmem.len == 0 and new_size > largest_alloc) {
-            return try self.wrappedRealloc(oldmem, old_align, new_size, new_align);
-        } else if (oldmem.len > largest_alloc and (new_size > largest_alloc or new_size == 0)) {
-            return try self.wrappedRealloc(oldmem, old_align, new_size, new_align);
-        } else if (oldmem.len > largest_alloc and new_size <= largest_alloc) {
-            var chunk = try self.allocator.alloc(u8, new_size);
-            mem.copy(u8, chunk, oldmem[0 .. chunk.len - 1]);
-            self.wrapped_allocator.free(oldmem);
-            return chunk;
-        } else if (oldmem.len <= largest_alloc and new_size > largest_alloc) {
-            var newbuf = try self.wrapped_allocator.alloc(u8, new_size);
-            mem.copy(u8, newbuf, oldmem);
-            self.allocator.free(oldmem);
-            return newbuf;
+            return 0;
         }
+
+        // handle external sizes
+        if (oldmem.len > largest_alloc) {
+            if (new_size > largest_alloc or new_size == 0) {
+                return try self.wrapped_allocator.callResizeFn(oldmem, new_size, len_align);
+            }
+            return largest_alloc + 1;
+        } else if (oldmem.len == 0 and new_size > largest_alloc) {
+            return try self.wrapped_allocator.callResizeFn(oldmem, new_size, len_align);
+        }
+
+        if (new_size > largest_alloc)
+            return error.OutOfMemory;
 
         assert(new_size <= largest_alloc);
-        return try self.internalRealloc(oldmem, old_align, new_size, new_align);
-    }
 
-    /// Allocator entrypoint
-    fn shrink(this: *Allocator, oldmem: []u8, old_align: u29, new_size: usize, new_align: u29) []u8 {
-        var self = @fieldParentPtr(AdmaAllocator, "allocator", this);
-
-        if (std.builtin.mode == .Debug or std.builtin.mode == .ReleaseSafe) {
-            if (self != &localAdma)
-                @panic("AdmaAllocator pointer passed to another thread; to do this safely, in the new thread init an AdmaAllocator");
-        }
-
-        if (oldmem.len > largest_alloc and new_size == 0) {
-            self.wrapped_allocator.free(oldmem);
-            return "";
-        } else if (oldmem.len > largest_alloc and new_size < largest_alloc) {
-            var chunk = self.allocator.alloc(u8, new_size) catch @panic("Failed to resize external buffer");
-            mem.copy(u8, chunk, oldmem[0 .. chunk.len - 1]);
-            self.wrapped_allocator.free(oldmem);
-            return chunk;
-        }
-        return self.internalShrink(oldmem, old_align, new_size, new_align);
-    }
-
-    /// Call wrapped allocator realloc; mostly used for allocations that are larger than largest_alloc
-    inline fn wrappedRealloc(self: *Self, oldmem: []u8, old_align: u29, new_size: usize, new_align: u29) ![]u8 {
-        return try self.wrapped_allocator.reallocFn(self.wrapped_allocator, oldmem, old_align, new_size, new_align);
-    }
-
-    /// Call wrapped allocator realloc; mostly used for allocations that are larger than largest_alloc
-    inline fn wrappedShrink(self: *Self, oldmem: []u8, old_align: u29, new_size: usize, new_align: u29) []u8 {
-        return self.wrapped_allocator.shrinkFn(self.wrapped_allocator, oldmem, old_align, new_align, new_align);
+        return try self.internal_resize(oldmem, new_size);
     }
 
     /// Select a bucked based on the size given
@@ -317,41 +298,30 @@ pub const AdmaAllocator = struct {
         };
     }
 
-    /// After entrypoint handles validation of sizing, this is the internal handler
-    fn internalRealloc(self: *Self, oldmem: []u8, old_align: u29, new_size: usize, new_align: u29) ![]u8 {
-        var old_bucket = self.pickBucket(@intCast(u16, oldmem.len));
-        var new_bucket = self.pickBucket(@intCast(u16, new_size));
+    fn internal_alloc(self: *Self, len: usize) ![]u8 {
+        const bucket = self.pickBucket(@intCast(u16, len));
 
-        if (oldmem.len == 0) {
-            var newchunk = try new_bucket.?.newChunk();
-            return newchunk[0..new_size];
-        } else if (new_size == 0) {
-            _ = old_bucket.?.freeChunk(oldmem, false);
-            return "";
-        }
+        assert(bucket != null);
 
-        var newchunk = try new_bucket.?.newChunk();
-        mem.copy(u8, newchunk, oldmem);
-        _ = old_bucket.?.freeChunk(oldmem, false);
-
-        return newchunk[0..new_size];
+        const newchunk = try bucket.?.newChunk();
+        return newchunk[0..len];
     }
 
-    /// After entrypoint handles validation of sizing, this is the internal handler
-    fn internalShrink(self: *Self, oldmem: []u8, old_align: u29, new_size: usize, new_align: u29) []u8 {
-        var old_bucket = self.pickBucket(@intCast(u16, oldmem.len));
-        var new_bucket = self.pickBucket(@intCast(u16, new_size));
+    fn internal_resize(self: *Self, oldmem: []u8, new_size: usize) !usize {
+        const old_bucket = self.pickBucket(@intCast(u16, oldmem.len));
+        const new_bucket = self.pickBucket(@intCast(u16, new_size));
 
-        if (new_size == 0) {
+        if (oldmem.len == 0) {
+            return 0;
+        } else if (new_size == 0) {
             _ = old_bucket.?.freeChunk(oldmem, false);
-            return "";
+            return 0;
         }
 
-        var newchunk = new_bucket.?.newChunk() catch @panic("Failed to safely shrink");
-        mem.copy(u8, newchunk, oldmem[0 .. newchunk.len - 1]);
-        _ = old_bucket.?.freeChunk(oldmem, false);
+        if (old_bucket == new_bucket)
+            return new_size;
 
-        return newchunk[0..new_size];
+        return error.OutOfMemory;
     }
 };
 

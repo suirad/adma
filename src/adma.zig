@@ -54,19 +54,37 @@ const LostAndFound = if (std.builtin.single_threaded == false)
             const count = @atomicRmw(usize, &self.thread_count, .Sub, 1, .SeqCst);
             if (count > 1) return;
 
-            // check for leaks and deinit all lists
-            assert(self.collector64.list.items.len == 0); // chunk was not collected by a thread
+            // deinit all lists. If any leftover allocations, use internal allocator to free
+            for (self.collector64.list.items) |item| {
+                self.allocator.free(item);
+            }
             self.collector64.list.deinit();
-            assert(self.collector128.list.items.len == 0); // chunk was not collected by a thread
+
+            for (self.collector128.list.items) |item| {
+                self.allocator.free(item);
+            }
             self.collector128.list.deinit();
-            assert(self.collector256.list.items.len == 0); // chunk was not collected by a thread
+
+            for (self.collector256.list.items) |item| {
+                self.allocator.free(item);
+            }
             self.collector256.list.deinit();
-            assert(self.collector512.list.items.len == 0); // chunk was not collected by a thread
+
+            for (self.collector512.list.items) |item| {
+                self.allocator.free(item);
+            }
             self.collector512.list.deinit();
-            assert(self.collector1024.list.items.len == 0); // chunk was not collected by a thread
+
+            for (self.collector1024.list.items) |item| {
+                self.allocator.free(item);
+            }
             self.collector1024.list.deinit();
-            assert(self.collector2048.list.items.len == 0); // chunk was not collected by a thread
+
+            for (self.collector2048.list.items) |item| {
+                self.allocator.free(item);
+            }
             self.collector2048.list.deinit();
+
             self.init = false;
         }
 
@@ -242,7 +260,7 @@ pub const AdmaAllocator = struct {
     }
 
     /// Allocator entrypoint
-    fn adma_alloc(this: *Allocator, len: usize, ptr_align: u29, len_align: u29) ![]u8 {
+    fn adma_alloc(this: *Allocator, len: usize, ptr_align: u29, len_align: u29, ret_addr: usize) ![]u8 {
         var self = @fieldParentPtr(Self, "allocator", this);
 
         if (len == 0) {
@@ -255,7 +273,7 @@ pub const AdmaAllocator = struct {
         return try self.internal_alloc(len);
     }
 
-    fn adma_resize(this: *Allocator, oldmem: []u8, new_size: usize, len_align: u29) !usize {
+    fn adma_resize(this: *Allocator, oldmem: []u8, old_align: u29, new_size: usize, len_align: u29, ret_addr: usize) !usize {
         var self = @fieldParentPtr(Self, "allocator", this);
 
         if (std.builtin.mode == .Debug or std.builtin.mode == .ReleaseSafe)
@@ -270,11 +288,11 @@ pub const AdmaAllocator = struct {
         // handle external sizes
         if (oldmem.len > largest_alloc) {
             if (new_size > largest_alloc or new_size == 0) {
-                return try self.wrapped_allocator.callResizeFn(oldmem, new_size, len_align);
+                return try self.wrapped_allocator.resizeFn(self.wrapped_allocator, oldmem, old_align, new_size, len_align, ret_addr);
             }
-            return largest_alloc + 1;
+            return try self.wrapped_allocator.resizeFn(self.wrapped_allocator, oldmem, old_align, largest_alloc + 1, len_align, ret_addr);
         } else if (oldmem.len == 0 and new_size > largest_alloc) {
-            return try self.wrapped_allocator.callResizeFn(oldmem, new_size, len_align);
+            return try self.wrapped_allocator.resizeFn(self.wrapped_allocator, oldmem, old_align, new_size, len_align, ret_addr);
         }
 
         if (new_size > largest_alloc)
@@ -400,8 +418,12 @@ const Bucket = struct {
 
     /// Adds the chunk to the global free list for this chunk_size
     fn freeRemoteChunk(self: *Self, data: []u8) void {
-        if (std.builtin.single_threaded)
-            @panic("Free'd invalid chunk. Ensure this data is allocated with Adma");
+        // If single_threaded, this fn will only be called if an unknown chunk was given
+        //   That data will just be given to the underlying allocator
+        if (std.builtin.single_threaded) {
+            self.parent.wrapped_allocator.free(data);
+            return;
+        }
 
         global_collector.lock(self.chunk_size);
         defer global_collector.unlock(self.chunk_size);

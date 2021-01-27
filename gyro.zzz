@@ -1,0 +1,16 @@
+pkgs:
+  adma:
+    version: 0.0.0
+    description: "A general purpose, multithreaded capable slab allocator for Zig"
+    license: MIT
+    source_url: "https://github.com/suirad/adma"
+    tags:
+      allocator
+      general-purpose
+      slab-allocator
+    root: src/adma.zig
+    files:
+      README.md
+      LICENSE
+      build.zig
+      tests/*.zig

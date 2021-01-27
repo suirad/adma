@@ -1,7 +1,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const ArrayList = std.ArrayList;
-const Mutex = std.mutex.Mutex;
+const Mutex = std.Thread.Mutex;
 const page_alloc = std.heap.page_allocator;
 
 const AdmaAllocator = @import("adma").AdmaAllocator;
